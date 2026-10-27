@@ -1,0 +1,230 @@
+From 641c3d2f2de7e728abe31083f3ffe936d7401963 Mon Sep 17 00:00:00 2001
+From: Bogdan Lapadat <lapadat.bogdanv@gmail.com>
+Date: Tue, 27 Oct 2026 07:52:02 +0000
+Subject: [PATCH 2/2] qwen35 hybrid: embeddings in host memory, VRAM reserve
+ setting, profile with the MTP block, multi-threaded gather and borrowed
+ staging for streamed prompts
+
+---
+ src/qwen35/q36_engine.cu | 135 ++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 120 insertions(+), 15 deletions(-)
+
+diff --git a/src/qwen35/q36_engine.cu b/src/qwen35/q36_engine.cu
+index 7cbe49e2..9d6f1fd4 100644
+--- a/src/qwen35/q36_engine.cu
++++ b/src/qwen35/q36_engine.cu
+@@ -1157,10 +1157,19 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
+         m.embd_row = row_bytes(m.embd_type, (int64_t) t->shape[0]);
+         const uint64_t nb = strata::tensor_payload_bytes(*t);
+         uint8_t* d = nullptr;
+-        CK(cudaMalloc(&d, nb));
+-        h2d_bounce(d, gm.shard(s).tensor_data(*t), nb);
++        if (std::getenv("STRATA_Q36_EMBD_HOST")) {
++            // the token embeddings in pinned host memory the GPU reads directly (zero-copy): one row per token crosses
++            // PCIe, and ~0.75 GiB of VRAM goes to routed experts instead (llama.cpp keeps them on the CPU as well)
++            uint8_t* h = nullptr;
++            CK(cudaHostAlloc((void**) &h, nb, cudaHostAllocMapped));
++            std::memcpy(h, gm.shard(s).tensor_data(*t), nb);
++            CK(cudaHostGetDevicePointer((void**) &d, h, 0));
++        } else {
++            CK(cudaMalloc(&d, nb));
++            h2d_bounce(d, gm.shard(s).tensor_data(*t), nb);
++            bytes += nb;
++        }
+         m.embd = d;
+-        bytes += nb;
+     }
+     std::fprintf(stderr, "strata-q36: %s: %zu tensors (layout checked), %.2f GiB on the GPU in %.1f s (the routed "
+                  "experts are placed after the engine's buffers)\n", path.c_str(), checked, (double) bytes / (1 << 30),
+@@ -2157,7 +2166,9 @@ struct Engine {
+     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
+         const auto& g = m->g;
+         const int N = (int) g.n_embd;
++        if (borrow_bytes && !(main_hybrid && T > hybrid_t && use_mmq)) restore_staging();
+         if (main_hybrid && T > hybrid_t && use_mmq) {
++            borrow_staging();
+             std::vector<int> seq;
+             for (size_t l = 0; l < m->layers.size(); ++l)
+                 if (lhy(l)) seq.push_back((int) l);
+@@ -2247,6 +2258,54 @@ struct Engine {
+         stream_pos = 0;
+         for (int i = 0; i < 2 && i < (int) seq.size(); ++i) stream_kick(i);
+     }
++    uint8_t* hstage[2] = {nullptr, nullptr};   // pinned host staging of the streamed layers (pack mode)
++    size_t borrow_bytes = 0;                   // one staging buffer, when the staging is borrowed from slots
++    struct Lent { int li; std::vector<int> experts; };
++    std::vector<Lent> lent;                    // the layers whose slots are lent to the staging right now
++    void borrow_staging() {
++        if (!borrow_bytes || stage[0]) return;
++        CK(cudaStreamSynchronize(st));
++        const size_t want = 2 * borrow_bytes + ((size_t) 64 << 20);
++        size_t freed = 0;
++        for (int li = (int) m->layers.size() - 1; li >= 0 && freed < want; --li) {
++            Layer& L = const_cast<Layer&>(layer_at(li));
++            if (L.n_slots <= 0 || !L.blobs) continue;
++            Hy& H = hy[(size_t) li];
++            lent.push_back({li, H.exp_in_slot});
++            CK(cudaFree(L.blobs));
++            L.blobs = nullptr;
++            freed += L.stride * (size_t) L.n_slots + kMmqTail;
++            std::fill(H.slot_of.begin(), H.slot_of.end(), -1);
++            CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), H.slot_of.size() * 4, cudaMemcpyHostToDevice));
++        }
++        for (int b = 0; b < 2; ++b) {
++            CK(cudaMalloc(&stage[b], borrow_bytes));
++            CK(cudaMemset(stage[b], 0, borrow_bytes));
++        }
++    }
++    void restore_staging() {
++        if (!borrow_bytes || !stage[0]) return;
++        CK(cudaStreamSynchronize(st));
++        CK(cudaStreamSynchronize(cst));
++        for (int b = 0; b < 2; ++b) {
++            CK(cudaFree(stage[b]));
++            stage[b] = nullptr;
++        }
++        for (const Lent& l : lent) {
++            Layer& L = const_cast<Layer&>(layer_at(l.li));
++            Hy& H = hy[(size_t) l.li];
++            CK(cudaMalloc(&L.blobs, L.stride * (size_t) L.n_slots + kMmqTail));
++            CK(cudaMemset(L.blobs, 0, L.stride * (size_t) L.n_slots + kMmqTail));
++            for (int s2 = 0; s2 < L.n_slots; ++s2) {
++                const int x = l.experts[(size_t) s2];
++                h2d_bounce(L.blobs + (size_t) s2 * L.stride, L.hx[(size_t) x], L.L.bytes);
++                pack_drop(L.hx[(size_t) x], L.L.bytes);
++                H.slot_of[(size_t) x] = s2;
++            }
++            CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), H.slot_of.size() * 4, cudaMemcpyHostToDevice));
++        }
++        lent.clear();
++    }
+     void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % 2, after its last reader
+         const int b = i % 2;
+         const Layer& L = layer_at(stream_seq[(size_t) i]);
+@@ -2259,7 +2318,41 @@ struct Engine {
+         const Hy& H = hy[(size_t) stream_seq[(size_t) i]];
+         // fewer than half the experts resident (a 12 GB card): the one whole-layer copy is faster than many small ones
+         // (RTX 3060, UD-Q4_K_XL at 37 of 256: pp2048 1970 whole vs 1540 in runs)
+-        if (all || 2 * L.n_slots < ne) {
++        if (hstage[b]) {   // pack mode: the CPU gathers the non-slot experts (RAM tier or pack) into pinned memory
++            CK(cudaEventSynchronize(ev_copy[b]));   // the previous DMA out of hstage[b] has finished
++            for (int x = 0; x < ne;) {
++                const bool dev = H.slot_of[(size_t) x] >= 0;
++                int y = x + 1;
++                if (dev)
++                    while (y < ne && H.slot_of[(size_t) y] == H.slot_of[(size_t) y - 1] + 1) ++y;
++                else
++                    while (y < ne && H.slot_of[(size_t) y] < 0) ++y;
++                const size_t n = (size_t) (y - x) * L.stride;
++                if (dev) {
++                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, L.blobs + (size_t) H.slot_of[(size_t) x] * L.stride,
++                                       n, cudaMemcpyDeviceToDevice, cst));
++                } else {
++                    // the gather runs on STRATA_Q36_GATHER_THREADS threads (default 4): one thread copies ~5-8 GB/s,
++                    // the PCIe link and the RAM take more
++                    static const int nth = [] { const char* e = std::getenv("STRATA_Q36_GATHER_THREADS"); return e && *e ? std::max(1, std::atoi(e)) : 4; }();
++                    const int cnt = y - x;
++                    auto work = [&](int t) {
++                        for (int e = x + t; e < y; e += nth) std::memcpy(hstage[b] + (size_t) e * L.stride, L.hx[(size_t) e], L.L.bytes);
++                    };
++                    if (nth <= 1 || cnt < 4) {
++                        for (int e = x; e < y; ++e) std::memcpy(hstage[b] + (size_t) e * L.stride, L.hx[(size_t) e], L.L.bytes);
++                    } else {
++                        std::vector<std::thread> th;
++                        for (int t = 1; t < nth; ++t) th.emplace_back(work, t);
++                        work(0);
++                        for (auto& h : th) h.join();
++                    }
++                    CK(cudaMemcpyAsync(stage[b] + (size_t) x * L.stride, hstage[b] + (size_t) x * L.stride, n,
++                                       cudaMemcpyHostToDevice, cst));
++                }
++                x = y;
++            }
++        } else if (all || 2 * L.n_slots < ne) {
+             CK(cudaMemcpyAsync(stage[b], L.hblobs, L.stride * (size_t) ne, cudaMemcpyHostToDevice, cst));
+         } else {
+             for (int x = 0; x < ne;) {
+@@ -3030,7 +3123,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+     }
+     size_t fr = 0, tot = 0;
+     CK(cudaMemGetInfo(&fr, &tot));
+-    const size_t reserve = (size_t) 768 << 20;
++    // STRATA_Q36_VRAM_RESERVE_MB: VRAM left free for the driver and later allocations (default 768)
++    const size_t reserve = (size_t) [] { const char* e = std::getenv("STRATA_Q36_VRAM_RESERVE_MB"); return e && *e ? std::atoll(e) : 768LL; }() << 20;
+     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
+                                         : (fr > reserve ? fr - reserve : 0);
+     // every expert fits once the packed Q8_0 decode copies are given back (a file a few GiB larger than the card's
+@@ -3125,10 +3219,16 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+ #endif
+     // a pack file larger than the RAM cannot feed the streamed prompt path (a whole layer per prompt chunk, copied
+     // from pageable file pages): every batch on slots + the pool instead, which reads only the missed experts
+-    if (pack_mode) E.hybrid_t = E.tmax;
+-    const size_t staging = E.use_mmq && E.main_hybrid && !pack_mode ? 2 * (max_layer + kMmqTail) : 0;
+-    size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
+-    if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
++    // STRATA_Q36_PACK_STREAM=1: big prompt chunks still stream whole layers to the GPU, through pinned host staging
++    const bool pack_stream = pack_mode && std::getenv("STRATA_Q36_PACK_STREAM") != nullptr;
++    if (pack_mode && !pack_stream) E.hybrid_t = E.tmax;
++    const size_t staging = E.use_mmq && E.main_hybrid && (!pack_mode || pack_stream) ? 2 * (max_layer + kMmqTail) : 0;
++    // STRATA_Q36_BORROW_STAGING=1 (pack streaming): the staging is not reserved; a big prompt borrows the VRAM of
++    // the last layers' slots for it and gives it back afterwards (see Engine::borrow_staging)
++    const bool borrow = pack_stream && std::getenv("STRATA_Q36_BORROW_STAGING") != nullptr;
++    const size_t staging_reserved = borrow ? 0 : staging;
++    size_t slot_bytes = budget2 > staging_reserved ? budget2 - staging_reserved : 0;
++    if (slot_bytes + staging_reserved + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging_reserved + ((size_t) 512 << 20) ? fr - staging_reserved - ((size_t) 512 << 20) : 0;
+     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
+     int S = slots > 0 ? (int) std::min<int64_t>(ne, slots) : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot);
+     if (mtp_only) {   // the main layers all, the MTP block what is left
+@@ -3138,7 +3238,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+     {   // what the hybrid mode allocates next (the staging pair, the CPU part's outputs, the slots) against the VRAM the
+         // sessions and the context left: said with the numbers instead of a cudaMalloc failure (8 slots on a 12 GB card)
+         const size_t Tn = (size_t) E.tmax, Nn = (size_t) g.n_embd, Kn = (size_t) m.top_k;
+-        size_t need = staging + Tn * Kn * Nn * 4 + Tn * Kn * 4;
++        size_t need = staging_reserved + Tn * Kn * Nn * 4 + Tn * Kn * 4;
+         for (Layer* L : all) {
+             if (mtp_only && L != &m.mtp) need += L->stride * (size_t) ne + kMmqTail;
+             else need += (S > 0 ? (size_t) S * L->stride + kMmqTail : 0);
+@@ -3202,8 +3302,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+         FILE* f = std::fopen(pf, "r");
+         size_t nl = 0;
+         long long nx = 0;
+-        if (f && std::fscanf(f, "q36profile %zu %lld", &nl, &nx) == 2 && nl == all.size() && nx == ne) {
+-            prof.assign(nl, std::vector<double>((size_t) ne, 0.0));
++        // a profile of the main layers also fits a placement with the MTP block (the block gets an even row)
++        if (f && std::fscanf(f, "q36profile %zu %lld", &nl, &nx) == 2 && (nl == all.size() || nl + 1 == all.size()) && nx == ne) {
++            prof.assign(all.size(), std::vector<double>((size_t) ne, 1.0));
+             for (size_t a = 0; a < nl; ++a)
+                 for (int64_t x = 0; x < ne; ++x) {
+                     unsigned long long v = 0;
+@@ -3213,7 +3314,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+         }
+         if (f) std::fclose(f);
+         std::fprintf(stderr, "strata-q36: expert profile %s: %s\n", pf, prof.empty() ? "not usable (other model or layout), ignored" : "loaded");
+-        if (!prof.empty()) E.static_slots = true;
++        if (!prof.empty() && !std::getenv("STRATA_Q36_REBALANCE")) E.static_slots = true;   // STRATA_Q36_REBALANCE=1: start from the profile, then follow the conversation
+     }
+     for (size_t li = 0; li < all.size(); ++li) {
+         Layer& L = *all[li];
+@@ -3308,13 +3409,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+     if (staging) {
+         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
+         for (int b = 0; b < 2; ++b) {
+-            CK(cudaMalloc(&E.stage[b], max_layer + kMmqTail));
+-            CK(cudaMemset(E.stage[b], 0, max_layer + kMmqTail));
++            if (!borrow) {
++                CK(cudaMalloc(&E.stage[b], max_layer + kMmqTail));
++                CK(cudaMemset(E.stage[b], 0, max_layer + kMmqTail));
++            }
++            if (pack_stream) CK(cudaHostAlloc((void**) &E.hstage[b], max_layer + kMmqTail, cudaHostAllocDefault));
+             CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
+             CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
+             CK(cudaEventRecord(E.ev_used[b], E.st));
+         }
+     }
++    E.borrow_bytes = borrow ? max_layer + kMmqTail : 0;
+     E.pool = std::make_unique<C::ExpertPool>(threads);
+     CK(cudaDeviceSynchronize());
+     if (mtp_only)
+-- 
+2.43.0
+
