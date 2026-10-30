@@ -1,7 +1,8 @@
 # Ornith-1.5-122B on one 24 GB GPU and 32 GB of RAM
 
 A 122B-parameter mixture-of-experts coding model (Ornith-1.5-122B, MIT) running on a single consumer GPU with
-24 GB of VRAM and 32 GB of system RAM, at about 22 tokens/s on real coding output, with a patched
+24 GB of VRAM and 32 GB of system RAM, at about **40 tokens/s** on real coding output (about 26 tokens/s with 4K
+tokens of code in context), with a patched
 [Strata](https://github.com/Niko1221/Strata) engine and [unsloth's](https://huggingface.co/unsloth/Ornith-1.5-122B-GGUF)
 UD-IQ2_XXS quant.
 
@@ -14,7 +15,7 @@ software fix, measured on the same coding prompt.
 |---|---|
 | GPU | AMD Radeon RX 7900 XTX, 24 GB (ROCm 7.2.3) |
 | CPU | Intel i7-7700K, 4 cores |
-| RAM | 32 GB DDR4, running at 2133 MT/s (XMP off) |
+| RAM | 32 GB DDR4-3200 (XMP on; the first numbers below were at 2133 MT/s with XMP off) |
 | Storage | NVMe SSD |
 | PCIe | 3.0 x16 |
 
@@ -48,19 +49,36 @@ All numbers: real coding prompts, 600 generated tokens, greedy, no speculative d
 | Host-to-GPU copies through a pinned bounce buffer (see below) | 12.5 |
 | Expert profile + RAM tier + VRAM slots for the most used experts | 15.7 |
 | Dense weights in less VRAM, embeddings in RAM, profile from coding tasks | 16.7 |
-| **unsloth UD-IQ2_XXS (smaller experts, more of them on the GPU)** | **21-25, about 22 typical** |
+| unsloth UD-IQ2_XXS (smaller experts, more of them on the GPU) | 21-25, about 22 typical |
+| RAM at 3200 MT/s (XMP on) | 25-29 |
+| **CPU/GPU split of the CPU-side experts + 512 MB VRAM cache (patches 4-5)** | **39-41** |
 
-The steps up to 16.7 were measured on AtomicChat's file; the last row is the setup in this repository. Run-to-run
-noise on this box is about 15%.
+The steps up to 16.7 were measured on AtomicChat's file; the rows from unsloth on are the setup in this repository
+(the last three rows with 300 generated tokens). Run-to-run noise on this box is about 10-15%.
+
+**The CPU/GPU split.** In this setup about half of each token's time was the CPU computing the experts that do not fit
+in VRAM, and that work is compute-bound, not memory-bound (about 11.6 GB/s out of the 44 GB/s the RAM can give).
+Meanwhile the GPU mostly waits. With `STRATA_Q36_SPLIT=1`, about 60% of those experts are copied over PCIe from
+pinned RAM and computed on the GPU while the CPU does the rest (the ratio balances itself). A small LRU cache in VRAM
+(`STRATA_Q36_SPLIT_CACHE_MB=512`) keeps recently copied experts, since about 25-30% of them are used again within a few
+tokens.
 
 Long prompts:
 
-| | Prompt (8,886 tokens) | Decode at 9K context |
+| | Prompt | Decode |
 |---|---|---|
-| **Long-prompt mode** (streamed layers, borrowed staging) | **407 tokens/s** (22 s) | 12.2 tokens/s |
+| Long-prompt mode, 8,886-token prompt, before the split | **407 tokens/s** (22 s) | 12.2 tokens/s at 9K |
+| Long-prompt mode, 4,096-token prompt, before the split (RAM at 3200) | | 15 tokens/s |
+| **Same, with split + cache** | | **26-27 tokens/s** |
+
+Editing a file the model has in context (2.4K-token file, "add a parameter, return the whole file"): 22-23 tokens/s
+with the split, **35-37 tokens/s** with prompt lookup on (`STRATA_Q36_LOOKUP=1`: drafts are copied from the
+context, 92-99% accepted). On new code the drafts mostly miss and it is 13% slower, so turn it on only for edits.
 
 What did not help: letting the CPU workers sleep sooner (slower), moving experts between GPU and RAM during
-generation (more copies than gain), 4096-token prompt chunks (crash in the hybrid path).
+generation (more copies than gain), 4096-token prompt chunks (crash in the hybrid path), HIP graphs (launch gaps are
+only 7-8% of a token), CU mode or wave64 builds, blocking instead of spinning waits, more than 5 CPU threads, and
+several requests at once (only 1.1-1.2x total, since the CPU work grows with every request).
 
 MTP (the model's own draft head) gives about 24 tokens/s with 1 draft token, but on long prompts the greedy output is
 not yet reproducible between runs with it on, so it is off here until that is understood.
@@ -86,7 +104,7 @@ Run the engine with `vm.swappiness=1` on a 32 GB machine, otherwise the kernel s
 
 ## Reproduce
 
-1. Build the patched Strata: the three patches in this repo apply on top of Strata `4b9e05a2`
+1. Build the patched Strata: the five patches in this repo apply in order on top of Strata `4b9e05a2`
    (also on the branch [`ornith-122b-24gb`](https://github.com/lapadatbogdan/Strata/tree/ornith-122b-24gb) of our fork), HIP build as in Strata's docs.
 2. Get the model: `scripts/get_model.sh <dir>` (42.0 GB from unsloth's repository).
 3. Run: `scripts/run.sh <build dir> <model> profiles/ornith-1.5-122b-code.q36profile`, or with `LONG=1` for long
@@ -95,9 +113,9 @@ Run the engine with `vm.swappiness=1` on a 32 GB machine, otherwise the kernel s
 
 ## Not measured (yet)
 
-- NVIDIA GPUs. Expected to be faster: the host side dominates here, and a modern CPU with DDR5 has 2-3x the
-  memory bandwidth of this box. **Estimate, not a measurement:** roughly 2x on an RTX 4090 with DDR5.
-  Numbers from other machines are very welcome.
+- NVIDIA GPUs and newer CPUs. The CPU side is compute-bound here (4 cores from 2017), so a current 8-16 core CPU and
+  PCIe 4.0 for the split should help most. **Estimate, not a measurement.** Numbers from other machines are very
+  welcome.
 
 ## Credits
 

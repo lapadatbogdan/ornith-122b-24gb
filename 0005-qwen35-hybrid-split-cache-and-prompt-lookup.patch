@@ -1,0 +1,448 @@
+From 7529196a008efa6aa31d2a3cae437389d3c9b7ec Mon Sep 17 00:00:00 2001
+From: Bogdan Lapadat <lapadat.bogdanv@gmail.com>
+Date: Thu, 29 Oct 2026 23:16:47 +0000
+Subject: [PATCH 2/2] qwen35 hybrid: split stage as an LRU expert cache, batch
+ windows in the split, prompt lookup decoding, opt-in kernel and wait variants
+
+STRATA_Q36_SPLIT_CACHE_MB=<MB>: the split stage keeps that many MB of streamed experts in VRAM
+(least recently used out); an expert of the layer already there runs on the GPU with no copy.
+The stage and cache are taken from the expert slots budget, not from the reserve.
+The split now also takes decode batch windows and verify windows of up to 8 rows, and the
+auto share is balanced after every step or window.
+STRATA_Q36_LOOKUP=1 (STRATA_Q36_LOOKUP_K, STRATA_Q36_LOOKUP_N): greedy prompt lookup decoding,
+drafts from the longest earlier match of the text tail, verified in one window; pauses after
+low acceptance.
+STRATA_Q36_MOE_OUT_4K=1: k_moe_out_small (fused next-layer q8_1) for n_embd up to 4096.
+STRATA_Q36_SPIN_PAUSE=1, STRATA_Q36_BLOCKING_SYNC=1: router wait variants (measured slower).
+STRATA_Q36_MISSLOG=<file>: per decode token and layer, the experts the CPU side gets.
+---
+ src/qwen35/q36_engine.cu   | 258 ++++++++++++++++++++++++++++++-------
+ src/qwen35/q36_kernels.cuh |   2 +-
+ 2 files changed, 213 insertions(+), 47 deletions(-)
+
+diff --git a/src/qwen35/q36_engine.cu b/src/qwen35/q36_engine.cu
+index bcfff574..0a37372a 100644
+--- a/src/qwen35/q36_engine.cu
++++ b/src/qwen35/q36_engine.cu
+@@ -78,6 +78,7 @@ const uint8_t* g_pack_map = nullptr;
+ size_t g_pack_len = 0;   // STRATA_Q36_DTIME: tells pack reads from RAM-tier reads
+ }  // namespace
+ #endif
++#include <unordered_map>
+ #include <unordered_set>
+ namespace {
+ // STRATA_Q36_SPLIT: the RAM-tier expert blocks registered (pinned) with the GPU, the only ones the split streams
+@@ -1354,6 +1355,13 @@ struct Engine {
+     uint8_t* sp_stage = nullptr;               // kSpMax expert blobs (+ tail)
+     size_t sp_stride = 0;
+     static constexpr int kSpMax = 8;
++    static constexpr int kSpRows = 8, kSpEnt = 64;   // rows of a window the split takes, streamed entries per layer
++    static constexpr int kSpG = 64;                  // groups (experts) of the split's GPU launch per layer
++    int sp_nslots = kSpMax;                          // stage slots (STRATA_Q36_SPLIT_CACHE_MB: more, kept as a cache)
++    bool sp_cache = false;
++    long long sp_clock = 0, sp_hits = 0;
++    std::vector<long long> sp_tick, sp_key;
++    std::unordered_map<long long, int> sp_map;
+     cudaStream_t sp_st = nullptr;
+     cudaEvent_t sp_copied = nullptr, sp_used = nullptr, sp_c0 = nullptr, sp_c1 = nullptr;
+     unsigned long long* sp_hmeta = nullptr;    // pinned: [0..8] grp_ptr, then int32 grp_start[9], n_groups, ent_dst[8], ent_tok[8]
+@@ -1963,7 +1971,10 @@ struct Engine {
+     /// The MoE block's end (k_moe_out) for T rows.
+     void moe_end(int T, const int32_t* prow, const float* shared, const float* sgate, const float* wn, float* hout, int sgs = 1) {
+         const int N = (int) m->g.n_embd, Kp = (int) m->top_k;
+-        const bool small = fast_k && T <= 8 && N <= 2048 && N % 256 == 0 && Kp <= 15;
++        // STRATA_Q36_MOE_OUT_4K=1: the one-block-per-row k_moe_out_small (1024 threads, the next layer's q8_1 input fused) for
++        // n_embd up to 4096 (Ornith / Qwen3.5-122B: 3072), instead of the 256-thread k_moe_out and a separate quantization
++        static const bool big = std::getenv("STRATA_Q36_MOE_OUT_4K") != nullptr;
++        const bool small = fast_k && T <= 8 && N <= (big ? 4096 : 2048) && N % 256 == 0 && Kp <= 15;
+         if (small && verify_k) {
+             if (!vx_) {
+                 CK(cudaMalloc((void**) &vx_, (size_t) 8 * 2048 * 4));
+@@ -2503,8 +2514,14 @@ struct Engine {
+         Hy& H = hy[li];
+         const Layer& L = layer_at((int) li);
+         const auto ts = Clock::now();
+-        while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
+-        }
++        static const bool blk = std::getenv("STRATA_Q36_BLOCKING_SYNC") != nullptr;
++        static const bool pause = std::getenv("STRATA_Q36_SPIN_PAUSE") != nullptr;
++        if (blk) CK(cudaEventSynchronize(ev_route));
++        else if (pause)
++            while (cudaEventQuery(ev_route) == cudaErrorNotReady) __builtin_ia32_pause();
++        else
++            while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
++            }
+         const auto t0 = Clock::now();
+         if (dt_tok) { dt.spin += ms_since(ts); ++dt.n_layers; }
+         // the missed entries per expert (up to MAXT tokens per job)
+@@ -2544,9 +2561,21 @@ struct Engine {
+             j.out[j.nt] = cpu_out + (size_t) e * N;
+             ++j.nt;
+         }
+-        // STRATA_Q36_SPLIT: one-token decode steps only
++        if (dt_tok) {   // STRATA_Q36_MISSLOG=<file>: per decode token and layer, the experts the CPU side gets (cache study)
++            static FILE* ml = [] { const char* f = std::getenv("STRATA_Q36_MISSLOG"); return f ? std::fopen(f, "w") : nullptr; }();
++            if (ml) {
++                std::fprintf(ml, "L %zu", li);
++                for (const auto& j : jobs) {
++                    int x = -1;
++                    for (int e = 0; e < n_ent; ++e) if (L.hx[(size_t) h_ids[e]] == j.blob) { x = h_ids[e]; break; }
++                    std::fprintf(ml, " %d", x);
++                }
++                std::fprintf(ml, "\n");
++            }
++        }
++        // STRATA_Q36_SPLIT: decode steps and batch windows of up to kSpRows rows
+         int n_sp = 0;
+-        if (sp_stage && T == 1 && n_miss > 0) {
++        if (sp_stage && T <= kSpRows && n_miss > 0) {
+             if (sp_timed) {   // the previous layer's copies are done (the stream passed them before this layer's router)
+                 float ms = 0;
+                 if (cudaEventElapsedTime(&ms, sp_c0, sp_c1) == cudaSuccess) { sp_copy_ms += ms; sp_tok_copy += ms; }
+@@ -2554,7 +2583,8 @@ struct Engine {
+             }
+             int n_cand = 0;
+             for (const auto& j : jobs) n_cand += g_pinned.count(j.blob) ? 1 : 0;
+-            if (sp_check())   // the reference: one slot entry (computed by the slot kernel on the GPU) computed by the pool as well
++            n_sp = 0;
++            if (sp_check() && T == 1)   // the reference: one slot entry (computed by the slot kernel on the GPU) computed by the pool as well
+                 for (int e = 0; e < n_ent; ++e)
+                     if (!h_miss[e]) {
+                         C::ExpertJobMulti j;
+@@ -2566,44 +2596,88 @@ struct Engine {
+                         sp_ref.push_back(e);
+                         break;
+                     }
+-            sp_acc += sp_frac * n_cand;
+-            int want = std::min({(int) sp_acc, n_cand, kSpMax});
++            // STRATA_Q36_SPLIT_CACHE_MB: the stage is a cache of sp_nslots experts (least recently used out); an expert of this
++            // layer already there runs on the GPU with no copy, the others are streamed into the oldest slots not used by
++            // this layer.  Without it the stage holds kSpMax experts and nothing is found there in practice.
++            const auto& g = m->g;
++            int32_t* mi = (int32_t*) (sp_hmeta + kSpG + 1);   // grp_start[kSpG + 1], n_groups, ent_dst[kSpEnt], ent_tok[kSpEnt]
++            int n_spe = 0, n_hit = 0;
++            const long long tick0 = ++sp_clock;
++            auto add_group = [&](int slot, const C::ExpertJobMulti& j) {
++                sp_hmeta[n_sp] = (unsigned long long) (sp_stage + (size_t) slot * sp_stride);
++                mi[n_sp] = n_spe;
++                for (int t = 0; t < j.nt; ++t) {
++                    const int e = (int) ((j.out[t] - cpu_out) / N);
++                    mi[kSpG + 2 + n_spe] = e;
++                    mi[kSpG + 2 + kSpEnt + n_spe] = e / Kp;
++                    ++n_spe;
++                    h_miss[e] = 0;   // the merge keeps the row the GPU writes
++                    if (sp_check()) sp_chk.push_back(e);   // STRATA_Q36_SPLIT_CHECK: the pool computes it too, compared below
++                }
++                ++n_sp;
++            };
++            auto key_of = [&](const C::ExpertJobMulti& j) -> long long {
++                for (int t = 0; t < n_ent; ++t)
++                    if (L.hx[(size_t) h_ids[t]] == j.blob) return ((long long) li << 20) | h_ids[t];
++                return -1;
++            };
++            if (sp_cache)   // the hits: free GPU work
++                for (int k = (int) jobs.size() - 1; k >= 0; --k) {
++                    const auto& j = jobs[(size_t) k];
++                    if (n_sp >= kSpG || n_spe + j.nt > kSpEnt) break;
++                    auto it = sp_map.find(key_of(j));
++                    if (it == sp_map.end()) continue;
++                    sp_tick[(size_t) it->second] = tick0;
++                    add_group(it->second, j);
++                    --n_cand;
++                    ++n_hit;
++                    if (!sp_check()) jobs.erase(jobs.begin() + k);
++                }
++            sp_acc += sp_frac * std::max(0, n_cand);
++            int want = std::min({(int) sp_acc, std::max(0, n_cand), sp_nslots, kSpG - n_sp});
+             sp_acc -= want;
++            int n_copy = 0;
+             if (want > 0) {
+-                const auto& g = m->g;
+-                int32_t* mi = (int32_t*) (sp_hmeta + kSpMax + 1);   // grp_start[kSpMax + 1], n_groups, ent_dst[kSpMax], ent_tok[kSpMax]
+                 CK(cudaStreamWaitEvent(sp_st, sp_used, 0));          // the previous layer's streamed kernel read the stage
+                 CK(cudaEventRecord(sp_c0, sp_st));
+-                for (int k = (int) jobs.size() - 1; k >= 0 && n_sp < want; --k) {
++                for (int k = (int) jobs.size() - 1; k >= 0 && n_copy < want; --k) {
+                     const auto& j = jobs[(size_t) k];
+                     if (!g_pinned.count(j.blob)) continue;
+-                    const int e = (int) ((j.out[0] - cpu_out) / N);
+-                    CK(cudaMemcpyAsync(sp_stage + (size_t) n_sp * sp_stride, j.blob, L.L.bytes, cudaMemcpyHostToDevice, sp_st));
+-                    sp_hmeta[n_sp] = (unsigned long long) (sp_stage + (size_t) n_sp * sp_stride);
+-                    mi[n_sp] = n_sp;
+-                    mi[kSpMax + 2 + n_sp] = e;
+-                    mi[2 * kSpMax + 2 + n_sp] = e / Kp;
+-                    h_miss[e] = 0;   // the merge keeps the row the GPU writes
+-                    if (sp_check()) sp_chk.push_back(e);   // STRATA_Q36_SPLIT_CHECK: the pool computes it too, compared below
+-                    else jobs.erase(jobs.begin() + k);
+-                    ++n_sp;
++                    if (sp_check() && std::find(sp_chk.begin(), sp_chk.end(), (int) ((j.out[0] - cpu_out) / N)) != sp_chk.end()) continue;
++                    if (n_spe + j.nt > kSpEnt) continue;
++                    int v = -1;   // the oldest slot this layer does not use
++                    for (int q = 0; q < sp_nslots; ++q)
++                        if (sp_tick[(size_t) q] < tick0 && (v < 0 || sp_tick[(size_t) q] < sp_tick[(size_t) v])) v = q;
++                    if (v < 0) break;
++                    if (sp_key[(size_t) v] >= 0) sp_map.erase(sp_key[(size_t) v]);
++                    const long long key = key_of(j);
++                    sp_key[(size_t) v] = key;
++                    if (key >= 0) sp_map[key] = v;
++                    sp_tick[(size_t) v] = tick0;
++                    CK(cudaMemcpyAsync(sp_stage + (size_t) v * sp_stride, j.blob, L.L.bytes, cudaMemcpyHostToDevice, sp_st));
++                    add_group(v, j);
++                    if (!sp_check()) jobs.erase(jobs.begin() + k);
++                    ++n_copy;
+                 }
+-                mi[n_sp] = n_sp;          // grp_start[n_groups]
+-                mi[kSpMax + 1] = n_sp;    // n_groups
+                 CK(cudaEventRecord(sp_c1, sp_st));
+                 CK(cudaEventRecord(sp_copied, sp_st));
+                 sp_timed = true;
+-                CK(cudaMemcpyAsync(sp_dmeta, sp_hmeta, (kSpMax + 1) * 8 + (3 * kSpMax + 2) * 4, cudaMemcpyHostToDevice, st));
+-                CK(cudaStreamWaitEvent(st, sp_copied, 0));
+-                const int32_t* dmi = (const int32_t*) (sp_dmeta + kSpMax + 1);
+-                K::native_expert_grouped(L.L, sp_dmeta, dmi, dmi + kSpMax + 1, dmi + kSpMax + 2, dmi + 2 * kSpMax + 2, n_sp,
++            }
++            if (n_sp > 0) {
++                mi[n_sp] = n_spe;         // grp_start[n_groups]
++                mi[kSpG + 1] = n_sp;      // n_groups
++                CK(cudaMemcpyAsync(sp_dmeta, sp_hmeta, (kSpG + 1) * 8 + (kSpG + 2 + 2 * kSpEnt) * 4, cudaMemcpyHostToDevice, st));
++                if (n_copy > 0) CK(cudaStreamWaitEvent(st, sp_copied, 0));
++                const int32_t* dmi = (const int32_t*) (sp_dmeta + kSpG + 1);
++                K::native_expert_grouped(L.L, sp_dmeta, dmi, dmi + kSpG + 1, dmi + kSpG + 2, dmi + kSpG + 2 + kSpEnt, n_sp,
+                                          n_ent, xq, escr, eparts, st);
+                 CK(cudaEventRecord(sp_used, st));
+-                if (!sp_check()) n_miss -= n_sp;
+-                sp_n += n_sp;
+-                sp_bytes += (long long) n_sp * (long long) L.L.bytes;
+-                (void) g;
++                if (!sp_check()) n_miss -= n_spe;
++                sp_n += n_copy;
++                sp_hits += n_hit;
++                sp_bytes += (long long) n_copy * (long long) L.L.bytes;
+             }
++            (void) g;
+         }
+         hy_cpu += n_miss;
+         hy_gpu += n_ent - n_miss;
+@@ -2648,7 +2722,7 @@ struct Engine {
+             sp_ref.clear();
+         }
+         if (dt_tok) dt.pool += ms_since(tp);
+-        if (sp_stage && T == 1) sp_tok_pool += ms_since(tp);
++        if (sp_stage && T <= kSpRows) sp_tok_pool += ms_since(tp);
+         CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
+         CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
+         k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, ecpu, d_miss, N);
+@@ -2854,11 +2928,7 @@ struct Engine {
+             pos += 1;
+             after_rows(1);
+             if (dt_tok) { dt.fwd += ms_since(tf); ++dt.n_tok; dt_tok = false; }
+-            if (sp_stage && sp_auto && sp_tok_pool + sp_tok_copy > 0) {   // more to the GPU while the pool is the longer side
+-                const double r = (sp_tok_pool - sp_tok_copy) / (sp_tok_pool + sp_tok_copy);
+-                sp_frac = std::min(0.95, std::max(0.05, sp_frac + 0.05 * r));
+-                sp_tok_pool = sp_tok_copy = 0;
+-            }
++            sp_balance();
+             on_chunk(1);
+             return 1;
+         }
+@@ -3151,6 +3221,51 @@ struct Engine {
+         return a;
+     }
+ 
++    /// STRATA_Q36_LOOKUP=1 (prompt lookup decoding): x_tok and the D drafts taken from an earlier match of the text's tail
++    /// in one verify window (the MTP path's window and commit); the accepted drafts' count is returned, picks[0 .. a] the
++    /// greedy tokens after x and after each accepted draft.
++    int lookup_step(int x_tok, int D, const int32_t* drafts, int32_t* picks) {
++        const int N = (int) m->g.n_embd;
++        if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
++        D = std::max(0, std::min(D, kVerify - 1));
++        const int T = D + 1;
++        CK(cudaStreamSynchronize(st));
++        hpin[16] = x_tok;
++        for (int d = 0; d < D; ++d) hpin[17 + d] = drafts[d];
++        hpin[1] = (int32_t) pos;
++        CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
++        CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
++        rows_deferred = true;
++        graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
++        rows_deferred = false;
++        CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
++        CK(cudaStreamSynchronize(st));
++        int a = 0;
++        while (a < D && hpin[2 + a] == drafts[a]) ++a;
++        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
++        commit(a + 1);
++        CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
++        pos += a + 1;
++        after_rows(a + 1);
++        lk_pass += 1;
++        lk_drafted += D;
++        lk_acc += a;
++        lk_ema = 0.8 * lk_ema + 0.2 * (D > 0 ? (double) a / D : 0.0);
++        if (lk_ema < 0.25) { lk_cool = 16; lk_ema = 0.5; }
++        sp_balance();
++        return a;
++    }
++    long long lk_pass = 0, lk_drafted = 0, lk_acc = 0;
++    double lk_ema = 0.5;   // the recent acceptance rate; below 0.25 the lookup pauses (lk_cool steps)
++    int lk_cool = 0;
++    void sp_balance() {   // STRATA_Q36_SPLIT auto: more to the GPU while the pool is the longer side
++        if (sp_stage && sp_auto && sp_tok_pool + sp_tok_copy > 0) {
++            const double r = (sp_tok_pool - sp_tok_copy) / (sp_tok_pool + sp_tok_copy);
++            sp_frac = std::min(0.95, std::max(0.05, sp_frac + 0.05 * r));
++            sp_tok_pool = sp_tok_copy = 0;
++        }
++    }
++
+     /// The first prompt after load ran at about half speed (pp4096 rep 0: ~1770 tok/s against ~3290): the GPU's code
+     /// objects, the BLAS handles' kernels and the decode graph are made on first use.  A throw-away prompt of one
+     /// chunk, a decode step and (with drafts) a speculative step at load do that before the first request; then the
+@@ -3337,8 +3452,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+     CK(cudaMemGetInfo(&fr, &tot));
+     // STRATA_Q36_VRAM_RESERVE_MB: VRAM left free for the driver and later allocations (default 768)
+     const size_t reserve = (size_t) [] { const char* e = std::getenv("STRATA_Q36_VRAM_RESERVE_MB"); return e && *e ? std::atoll(e) : 768LL; }() << 20;
++    // STRATA_Q36_SPLIT: its stage (and cache) come out of the slots budget, not out of the reserve
++    const size_t sp_room = split_on() ? ((size_t) 32 << 20) + (size_t) ([] { const char* e = std::getenv("STRATA_Q36_SPLIT_CACHE_MB"); return e && *e ? std::atof(e) : 0.0; }() * 1e6) : 0;
+     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
+-                                        : (fr > reserve ? fr - reserve : 0);
++                                        : (fr > reserve + sp_room ? fr - reserve - sp_room : 0);
+     // every expert fits once the packed Q8_0 decode copies are given back (a file a few GiB larger than the card's
+     // room, UD-Q6_K_XL on 32 GB): drop them - the decode reads the GGUF layout then, bitwise the same outputs, a little
+     // slower - rather than run the hybrid mode with its CPU share and streamed prompt layers.  STRATA_Q36_KEEP_PACKED=1
+@@ -3364,7 +3481,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+                      "expert fits in VRAM (STRATA_Q36_KEEP_PACKED=1 keeps them and runs the hybrid mode)\n",
+                      (double) packed_bytes / (1 << 30));
+     }
+-    size_t budget2 = vram_gib >= 0 ? budget : (fr > reserve ? fr - reserve : 0);
++    size_t budget2 = vram_gib >= 0 ? budget : (fr > reserve + sp_room ? fr - reserve - sp_room : 0);
+     // the MAIN layers' experts fit, the MTP block's not all (UD-Q6_K_XL on 32 GB): the main layers all in VRAM - the
+     // text is the all-in-VRAM text, the decode graph stays - and the MTP block's experts on slots + the CPU pool (its
+     // drafts only).  When that needs it: the attention scores buffer at 64 MB instead of 256 MB (more, smaller
+@@ -3630,7 +3747,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+         size_t mx = 0;
+         for (size_t li = 0; li < all.size(); ++li) mx = std::max(mx, all[li]->stride);
+         E.sp_stride = (mx + 255) / 256 * 256;
+-        const size_t want = E.sp_stride * Engine::kSpMax + kMmqTail;
++        const char* cm = std::getenv("STRATA_Q36_SPLIT_CACHE_MB");
++        if (cm && std::atof(cm) > 0) {
++            E.sp_nslots = std::max<int>(Engine::kSpMax, (int) (std::atof(cm) * 1e6 / (double) E.sp_stride));
++            E.sp_cache = true;
++        }
++        E.sp_tick.assign((size_t) E.sp_nslots, 0);
++        E.sp_key.assign((size_t) E.sp_nslots, -1);
++        const size_t want = E.sp_stride * (size_t) E.sp_nslots + kMmqTail;
+         if (cudaMalloc(&E.sp_stage, want) != cudaSuccess) {
+             (void) cudaGetLastError();
+             E.sp_stage = nullptr;
+@@ -3643,14 +3767,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+             CK(cudaEventCreate(&E.sp_c0));
+             CK(cudaEventCreate(&E.sp_c1));
+             CK(cudaEventRecord(E.sp_used, E.st));
+-            CK(cudaHostAlloc((void**) &E.sp_hmeta, 512, cudaHostAllocDefault));
+-            CK(cudaMalloc((void**) &E.sp_dmeta, 512));
++            CK(cudaHostAlloc((void**) &E.sp_hmeta, 4096, cudaHostAllocDefault));
++            CK(cudaMalloc((void**) &E.sp_dmeta, 4096));
+             const char* fr = std::getenv("STRATA_Q36_SPLIT_FRAC");
+             if (fr && *fr) { E.sp_frac = std::atof(fr); E.sp_auto = false; }
+             size_t fb = 0, tb = 0;
+             CK(cudaMemGetInfo(&fb, &tb));
+             std::fprintf(stderr, "strata-q36: split: %zu RAM-tier experts pinned, stage %.1f MB (%d experts), frac %.2f, %.0f MB VRAM free\n",
+-                         g_pinned.size(), want / 1e6, Engine::kSpMax, E.sp_frac, fb / 1e6);
++                         g_pinned.size(), want / 1e6, E.sp_nslots, E.sp_frac, fb / 1e6);
+         }
+     }
+     if (staging) {
+@@ -4265,8 +4389,9 @@ struct Serve {
+         struct rusage ru0;
+         getrusage(RUSAGE_SELF, &ru0);
+         E.dt = {};
+-        E.sp_n = E.sp_bytes = 0;
++        E.sp_n = E.sp_bytes = E.sp_hits = 0;
+         E.sp_copy_ms = 0;
++        E.lk_pass = E.lk_drafted = E.lk_acc = 0;
+         long long produced = 0, offered = 0, accepted = 0;
+         const char* finish = "length";
+         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
+@@ -4345,6 +4470,40 @@ struct Serve {
+                 continue;
+             }
+             if (E.pos + 1 > E.ctx) break;
++            static const bool lookup = std::getenv("STRATA_Q36_LOOKUP") != nullptr;
++            if (lookup && E.lk_cool > 0) --E.lk_cool;
++            else if (lookup && !smp.needs_logits() && n_active == 0 && !E.mtab_now && !E.map_on) {
++                // the longest earlier match (up to kMaxN tokens, at least kMinN) of the text's tail (which ends with nx)
++                static const int K = [] { const char* e = std::getenv("STRATA_Q36_LOOKUP_K"); return e ? std::atoi(e) : 7; }();
++                static const int kMinN = [] { const char* e = std::getenv("STRATA_Q36_LOOKUP_N"); return e ? std::atoi(e) : 3; }();
++                constexpr int kMaxN = 8;
++                const int L = (int) hist.size();
++                int best = -1, bestn = 0;
++                for (int i = L - 2; i >= 0 && bestn < kMaxN; --i) {   // i: the end of a candidate match (hist[i] ~ hist[L-1])
++                    int n = 0;
++                    while (n < kMaxN && i - n >= 0 && hist[(size_t) (i - n)] == hist[(size_t) (L - 1 - n)]) ++n;
++                    if (n >= kMinN && n > bestn) { bestn = n; best = i; }
++                }
++                int D = 0;
++                int32_t dr[16];
++                if (best >= 0)
++                    for (int k = best + 1; k < L && D < K && D < 15; ++k) dr[D++] = hist[(size_t) k];
++                if (D > 0 && E.pos + D + 1 <= E.ctx) {
++                    int32_t pk[16];
++                    const int a = E.lookup_step(nx, D, dr, pk);
++                    ss.live.push_back(nx);
++                    for (int i = 0; i < a; ++i) ss.live.push_back(dr[i]);
++                    offered += D;
++                    accepted += a;
++                    fix.clear();
++                    bool ended = false;
++                    for (int i = 0; i < a && !ended; ++i)
++                        if (!emit(dr[i])) ended = true;
++                    if (ended) break;
++                    nx = pk[a];
++                    continue;
++                }
++            }
+             const int32_t one = nx;
+             E.process(&one, 1, [](int64_t) {});
+             ss.live.push_back(nx);
+@@ -4365,9 +4524,13 @@ struct Serve {
+                          D.n_cpu_layers * k, D.n_layers * k, D.n_miss * k, D.n_ent * k, D.bytes * k / 1e6,
+                          D.n_pack * k, D.pool > 0 ? (double) D.bytes / (D.pool * 1e6) : 0.0,
+                          ru1.ru_majflt - ru0.ru_majflt, ru1.ru_minflt - ru0.ru_minflt);
++            if (E.lk_pass)
++                std::fprintf(stderr, "strata-q36 LOOKUP: %lld passes, %lld drafted, %lld accepted (%.1f%%), %.2f tokens per pass\n",
++                             E.lk_pass, E.lk_drafted, E.lk_acc, 100.0 * E.lk_acc / std::max(1LL, E.lk_drafted),
++                             (double) (E.lk_acc + E.lk_pass) / E.lk_pass);
+             if (E.sp_stage)
+-                std::fprintf(stderr, "strata-q36 SPLIT: frac %.3f%s, %.1f experts/token streamed (%.1f MB/token), copy %.3f ms/token, PCIe %.2f GB/s\n",
+-                             E.sp_frac, E.sp_auto ? " (auto, now)" : "", E.sp_n * k, E.sp_bytes * k / 1e6, E.sp_copy_ms * k,
++                std::fprintf(stderr, "strata-q36 SPLIT: frac %.3f%s, %.1f experts/token streamed (%.1f MB/token), %.1f cache hits/token, copy %.3f ms/token, PCIe %.2f GB/s\n",
++                             E.sp_frac, E.sp_auto ? " (auto, now)" : "", E.sp_n * k, E.sp_bytes * k / 1e6, E.sp_hits * k, E.sp_copy_ms * k,
+                              E.sp_copy_ms > 0 ? (double) E.sp_bytes / (E.sp_copy_ms * 1e6) : 0.0);
+             if (E.sp_chk_n)
+                 std::fprintf(stderr, "strata-q36 SPLIT_CHECK: %lld streamed rows vs the pool: rel L2 mean %.3e max %.3e\n", E.sp_chk_n,
+@@ -4445,6 +4608,9 @@ int serve(Engine& E) {
+ }  // namespace
+ 
+ int strata::qwen35::run(int argc, char** argv) {
++    // STRATA_Q36_BLOCKING_SYNC=1: the HIP runtime's waits block instead of spinning (set before any stream exists), and the
++    // router wait below is an event synchronize
++    if (std::getenv("STRATA_Q36_BLOCKING_SYNC")) (void) hipSetDeviceFlags(hipDeviceScheduleBlockingSync);
+     std::string model, tokens, force, dump_full, emb_file;
+     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
+     double expert_vram = -1.0;
+diff --git a/src/qwen35/q36_kernels.cuh b/src/qwen35/q36_kernels.cuh
+index 21617b0b..9f43ee39 100644
+--- a/src/qwen35/q36_kernels.cuh
++++ b/src/qwen35/q36_kernels.cuh
+@@ -226,7 +226,7 @@ __global__ void __launch_bounds__(256) k_add_rms_q(float* x, const float* y, con
+ __global__ void __launch_bounds__(1024) k_moe_out_small(float* x, const float* parts, const int32_t* prow, const float* wts,
+                                                         int K_, const float* shared, const float* sgate, int sg_stride,
+                                                         const float* wn, float* h, int n, float eps, QB* hq = nullptr) {
+-    __shared__ float vv[2048];
++    __shared__ float vv[4096];   // n <= 4096 (STRATA_Q36_MOE_OUT_4K: n_embd 3072 too; before: n <= 2048)
+     __shared__ float sh[256];
+     __shared__ const float* pk[16];
+     const int t = blockIdx.x;
+-- 
+2.43.0
+

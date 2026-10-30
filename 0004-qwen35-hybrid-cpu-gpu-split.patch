@@ -1,0 +1,371 @@
+From adcda32e9823c66fb86ec3fae65120e1c98c76b9 Mon Sep 17 00:00:00 2001
+From: Bogdan Lapadat <lapadat.bogdanv@gmail.com>
+Date: Thu, 29 Oct 2026 20:06:11 +0000
+Subject: [PATCH 1/2] qwen35 hybrid: opt-in CPU/GPU split of the CPU-side
+ experts (STRATA_Q36_SPLIT), decode timers (STRATA_Q36_DTIME)
+
+STRATA_Q36_SPLIT=1: per one-token decode layer, a share of the experts the CPU pool would compute
+is copied from the pinned RAM tier to a VRAM stage on a separate stream and computed with the slot
+experts kernel while the pool computes the rest. STRATA_Q36_SPLIT_FRAC fixes the share; unset, it
+is balanced per token so the pool time matches the copy time. The RAM tier is page-aligned and
+registered with the GPU when the split is on. STRATA_Q36_SPLIT_CHECK=1 also computes the streamed
+rows (and one slot row as a reference) on the pool and reports the relative L2 difference.
+
+STRATA_Q36_DTIME=1: per decode token host timers (router wait, pool, greedy sync), CPU expert
+bytes, pool bandwidth and page faults, printed at the end of a serve request.
+
+Also STRATA_Q36_PROFILE_DECODE_ONLY: the routing profile counts generated tokens only.
+---
+ src/qwen35/q36_engine.cu | 228 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 225 insertions(+), 3 deletions(-)
+
+diff --git a/src/qwen35/q36_engine.cu b/src/qwen35/q36_engine.cu
+index 7b3c57ae..bcfff574 100644
+--- a/src/qwen35/q36_engine.cu
++++ b/src/qwen35/q36_engine.cu
+@@ -63,6 +63,7 @@
+ #if !defined(_WIN32)
+ #include <fcntl.h>
+ #include <sys/mman.h>
++#include <sys/resource.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+ #endif
+@@ -74,6 +75,17 @@ namespace {
+ // a second copy of the ones on the card (on 32 GB, 13.7 GiB of slot experts pushed the CPU's experts out to the disk).
+ int g_pack_fd = -1;
+ const uint8_t* g_pack_map = nullptr;
++size_t g_pack_len = 0;   // STRATA_Q36_DTIME: tells pack reads from RAM-tier reads
++}  // namespace
++#endif
++#include <unordered_set>
++namespace {
++// STRATA_Q36_SPLIT: the RAM-tier expert blocks registered (pinned) with the GPU, the only ones the split streams
++std::unordered_set<const void*> g_pinned;
++bool split_on() { static const bool on = std::getenv("STRATA_Q36_SPLIT") != nullptr && std::atoi(std::getenv("STRATA_Q36_SPLIT")) != 0; return on; }
++}  // namespace
++#if !defined(_WIN32)
++namespace {
+ void pack_drop(const uint8_t* ptr, size_t len) {
+     if (g_pack_fd < 0 || !g_pack_map || ptr < g_pack_map) return;
+     const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+@@ -1330,6 +1342,35 @@ struct Engine {
+     int stream_pos = 0;
+     long long hy_cpu = 0, hy_gpu = 0, hy_swaps = 0;   // entries computed on the CPU / GPU, slot replacements
+     double hy_cpu_ms = 0;
++    // STRATA_Q36_DTIME=1: per decode token host timers (ms) and the CPU pool's traffic
++    struct DTime {
++        double spin = 0, build = 0, pool = 0, fwd = 0, greedy = 0;
++        long long n_tok = 0, n_miss = 0, n_ent = 0, bytes = 0, n_pack = 0, n_cpu_layers = 0, n_layers = 0;
++    } dt;
++    bool dt_tok = false;   // inside a one-token process()
++    // STRATA_Q36_SPLIT=1: per decode layer, a share (STRATA_Q36_SPLIT_FRAC, default 0.5) of the experts the CPU pool would
++    // compute are copied to the GPU (sp_stage, on sp_st) and computed there with the slot experts' kernel, while the pool
++    // computes the rest.  Only experts of the pinned RAM tier are streamed (never from the mapped pack).
++    uint8_t* sp_stage = nullptr;               // kSpMax expert blobs (+ tail)
++    size_t sp_stride = 0;
++    static constexpr int kSpMax = 8;
++    cudaStream_t sp_st = nullptr;
++    cudaEvent_t sp_copied = nullptr, sp_used = nullptr, sp_c0 = nullptr, sp_c1 = nullptr;
++    unsigned long long* sp_hmeta = nullptr;    // pinned: [0..8] grp_ptr, then int32 grp_start[9], n_groups, ent_dst[8], ent_tok[8]
++    unsigned long long* sp_dmeta = nullptr;
++    double sp_frac = 0.55, sp_acc = 0.0;
++    bool sp_auto = true;                       // STRATA_Q36_SPLIT_FRAC unset: balance the pool's time against the copies' per token
++    double sp_tok_pool = 0, sp_tok_copy = 0;
++    bool sp_timed = false;
++    double sp_copy_ms = 0;
++    long long sp_n = 0, sp_bytes = 0;
++    static bool sp_check() { static const bool on = std::getenv("STRATA_Q36_SPLIT_CHECK") != nullptr; return on; }
++    std::vector<int> sp_chk, sp_ref;
++    double sp_ref_max = 0, sp_ref_sum = 0;
++    long long sp_ref_n = 0;
++    double sp_chk_max = 0, sp_chk_sum = 0;
++    long long sp_chk_n = 0;
++    static bool dt_on() { static const bool on = std::getenv("STRATA_Q36_DTIME") != nullptr; return on; }
+     // decode / verify rows: their routing is counted once the rows are kept (commit), so a verify window's rejected
+     // drafts never move the slots; the slots follow the counts at every kRebalanceEvery-th position exactly (a
+     // window never steps over one), so plain and speculative decoding see the same slot tables at every position
+@@ -2114,7 +2155,9 @@ struct Engine {
+             if (lhy(li))
+                 for (int x = 0; x < ne; ++x) {
+                     hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
+-                    if (!hy[li].cnt.empty()) hy[li].cnt[(size_t) x] += h_cnt[li * g.n_expert + x];
++                    // STRATA_Q36_PROFILE_DECODE_ONLY=1: the profile counts only generated tokens, not the prompt
++                    static const bool prof_dec_only = std::getenv("STRATA_Q36_PROFILE_DECODE_ONLY") != nullptr;
++                    if (!hy[li].cnt.empty() && !prof_dec_only) hy[li].cnt[(size_t) x] += h_cnt[li * g.n_expert + x];
+                 }
+             const int64_t maxr = hpin[10];
+             const uint8_t* wbase = lhy(li) ? stream_take((int) li) : L.blobs;
+@@ -2459,9 +2502,11 @@ struct Engine {
+         const int n_ent = T * Kp;
+         Hy& H = hy[li];
+         const Layer& L = layer_at((int) li);
++        const auto ts = Clock::now();
+         while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
+         }
+         const auto t0 = Clock::now();
++        if (dt_tok) { dt.spin += ms_since(ts); ++dt.n_layers; }
+         // the missed entries per expert (up to MAXT tokens per job)
+         jobs.clear();
+         std::vector<char> quantized((size_t) T, 0);
+@@ -2476,7 +2521,8 @@ struct Engine {
+             const int x = h_ids[e];
+             if (!defer) {
+                 H.score[(size_t) x] += 1.0;
+-                if (!H.cnt.empty()) ++H.cnt[(size_t) x];
++                static const bool prof_dec_only2 = std::getenv("STRATA_Q36_PROFILE_DECODE_ONLY") != nullptr;
++                if (!H.cnt.empty() && (!prof_dec_only2 || n_ent <= (int) m->top_k)) ++H.cnt[(size_t) x];
+             }
+             h_miss[e] = H.slot_of[(size_t) x] < 0;
+             if (!h_miss[e]) continue;
+@@ -2498,11 +2544,111 @@ struct Engine {
+             j.out[j.nt] = cpu_out + (size_t) e * N;
+             ++j.nt;
+         }
++        // STRATA_Q36_SPLIT: one-token decode steps only
++        int n_sp = 0;
++        if (sp_stage && T == 1 && n_miss > 0) {
++            if (sp_timed) {   // the previous layer's copies are done (the stream passed them before this layer's router)
++                float ms = 0;
++                if (cudaEventElapsedTime(&ms, sp_c0, sp_c1) == cudaSuccess) { sp_copy_ms += ms; sp_tok_copy += ms; }
++                sp_timed = false;
++            }
++            int n_cand = 0;
++            for (const auto& j : jobs) n_cand += g_pinned.count(j.blob) ? 1 : 0;
++            if (sp_check())   // the reference: one slot entry (computed by the slot kernel on the GPU) computed by the pool as well
++                for (int e = 0; e < n_ent; ++e)
++                    if (!h_miss[e]) {
++                        C::ExpertJobMulti j;
++                        j.blob = L.hx[(size_t) h_ids[e]];
++                        j.nact[0] = acts;
++                        j.out[0] = cpu_out + (size_t) e * N;
++                        j.nt = 1;
++                        jobs.insert(jobs.begin(), j);
++                        sp_ref.push_back(e);
++                        break;
++                    }
++            sp_acc += sp_frac * n_cand;
++            int want = std::min({(int) sp_acc, n_cand, kSpMax});
++            sp_acc -= want;
++            if (want > 0) {
++                const auto& g = m->g;
++                int32_t* mi = (int32_t*) (sp_hmeta + kSpMax + 1);   // grp_start[kSpMax + 1], n_groups, ent_dst[kSpMax], ent_tok[kSpMax]
++                CK(cudaStreamWaitEvent(sp_st, sp_used, 0));          // the previous layer's streamed kernel read the stage
++                CK(cudaEventRecord(sp_c0, sp_st));
++                for (int k = (int) jobs.size() - 1; k >= 0 && n_sp < want; --k) {
++                    const auto& j = jobs[(size_t) k];
++                    if (!g_pinned.count(j.blob)) continue;
++                    const int e = (int) ((j.out[0] - cpu_out) / N);
++                    CK(cudaMemcpyAsync(sp_stage + (size_t) n_sp * sp_stride, j.blob, L.L.bytes, cudaMemcpyHostToDevice, sp_st));
++                    sp_hmeta[n_sp] = (unsigned long long) (sp_stage + (size_t) n_sp * sp_stride);
++                    mi[n_sp] = n_sp;
++                    mi[kSpMax + 2 + n_sp] = e;
++                    mi[2 * kSpMax + 2 + n_sp] = e / Kp;
++                    h_miss[e] = 0;   // the merge keeps the row the GPU writes
++                    if (sp_check()) sp_chk.push_back(e);   // STRATA_Q36_SPLIT_CHECK: the pool computes it too, compared below
++                    else jobs.erase(jobs.begin() + k);
++                    ++n_sp;
++                }
++                mi[n_sp] = n_sp;          // grp_start[n_groups]
++                mi[kSpMax + 1] = n_sp;    // n_groups
++                CK(cudaEventRecord(sp_c1, sp_st));
++                CK(cudaEventRecord(sp_copied, sp_st));
++                sp_timed = true;
++                CK(cudaMemcpyAsync(sp_dmeta, sp_hmeta, (kSpMax + 1) * 8 + (3 * kSpMax + 2) * 4, cudaMemcpyHostToDevice, st));
++                CK(cudaStreamWaitEvent(st, sp_copied, 0));
++                const int32_t* dmi = (const int32_t*) (sp_dmeta + kSpMax + 1);
++                K::native_expert_grouped(L.L, sp_dmeta, dmi, dmi + kSpMax + 1, dmi + kSpMax + 2, dmi + 2 * kSpMax + 2, n_sp,
++                                         n_ent, xq, escr, eparts, st);
++                CK(cudaEventRecord(sp_used, st));
++                if (!sp_check()) n_miss -= n_sp;
++                sp_n += n_sp;
++                sp_bytes += (long long) n_sp * (long long) L.L.bytes;
++                (void) g;
++            }
++        }
+         hy_cpu += n_miss;
+         hy_gpu += n_ent - n_miss;
+         if (n_miss == 0) return;
++        const auto tp = Clock::now();
++        if (dt_tok) {
++            dt.build += ms_since(t0);
++            dt.n_miss += n_miss;
++            dt.n_ent += n_ent;
++            ++dt.n_cpu_layers;
++            for (const auto& j : jobs) {
++                dt.bytes += (long long) L.L.bytes;
++                if (g_pack_map && j.blob >= g_pack_map && j.blob < g_pack_map + g_pack_len) ++dt.n_pack;
++            }
++        }
+         pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
+         hy_cpu_ms += ms_since(t0);
++        if (!sp_chk.empty()) {   // the GPUs rows of the streamed experts vs the pools rows of the same entries
++            CK(cudaStreamSynchronize(st));
++            std::vector<float> gr((size_t) N);
++            for (int e : sp_chk) {
++                CK(cudaMemcpy(gr.data(), eparts + (size_t) e * N, (size_t) N * 4, cudaMemcpyDeviceToHost));
++                const float* cr = cpu_out + (size_t) e * N;
++                double num = 0, den = 0;
++                for (int i = 0; i < N; ++i) { num += (gr[i] - cr[i]) * (double) (gr[i] - cr[i]); den += (double) cr[i] * cr[i]; }
++                const double rel = std::sqrt(num / std::max(den, 1e-30));
++                sp_chk_max = std::max(sp_chk_max, rel);
++                sp_chk_sum += rel;
++                ++sp_chk_n;
++            }
++            sp_chk.clear();
++            for (int e : sp_ref) {
++                CK(cudaMemcpy(gr.data(), eparts + (size_t) e * N, (size_t) N * 4, cudaMemcpyDeviceToHost));
++                const float* cr = cpu_out + (size_t) e * N;
++                double num = 0, den = 0;
++                for (int i = 0; i < N; ++i) { num += (gr[i] - cr[i]) * (double) (gr[i] - cr[i]); den += (double) cr[i] * cr[i]; }
++                const double rel = std::sqrt(num / std::max(den, 1e-30));
++                sp_ref_max = std::max(sp_ref_max, rel);
++                sp_ref_sum += rel;
++                ++sp_ref_n;
++            }
++            sp_ref.clear();
++        }
++        if (dt_tok) dt.pool += ms_since(tp);
++        if (sp_stage && T == 1) sp_tok_pool += ms_since(tp);
+         CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
+         CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
+         k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, ecpu, d_miss, N);
+@@ -2689,6 +2835,8 @@ struct Engine {
+             }
+         };
+         if (n == 1) {
++            const auto tf = Clock::now();
++            dt_tok = dt_on();
+             CK(cudaStreamSynchronize(st));   // the pinned staging is free again
+             hpin[0] = toks[0];
+             hpin[1] = (int32_t) pos;
+@@ -2705,6 +2853,12 @@ struct Engine {
+             CK(cudaMemcpyAsync(hlast, hmain, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+             pos += 1;
+             after_rows(1);
++            if (dt_tok) { dt.fwd += ms_since(tf); ++dt.n_tok; dt_tok = false; }
++            if (sp_stage && sp_auto && sp_tok_pool + sp_tok_copy > 0) {   // more to the GPU while the pool is the longer side
++                const double r = (sp_tok_pool - sp_tok_copy) / (sp_tok_pool + sp_tok_copy);
++                sp_frac = std::min(0.95, std::max(0.05, sp_frac + 0.05 * r));
++                sp_tok_pool = sp_tok_copy = 0;
++            }
+             on_chunk(1);
+             return 1;
+         }
+@@ -3026,8 +3180,10 @@ struct Engine {
+     }
+ 
+     int greedy() {
++        const auto tg = Clock::now();
+         CK(cudaMemcpyAsync(hpin + 2, pick, 4, cudaMemcpyDeviceToHost, st));
+         CK(cudaStreamSynchronize(st));
++        if (dt_on()) dt.greedy += ms_since(tg);
+         return hpin[2];
+     }
+     void host_logits(std::vector<float>& out) {
+@@ -3149,6 +3305,7 @@ uint8_t* map_pack(const Model& m, const std::vector<Layer*>& layers, size_t host
+     }
+     g_pack_fd = fd;   // kept open: pack_drop gives the slot experts' pages back
+     g_pack_map = (const uint8_t*) p;
++    g_pack_len = kPackHeader + host;
+     return (uint8_t*) p + kPackHeader;
+ }
+ }  // namespace
+@@ -3439,7 +3596,15 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+             for (const Cand& c : cand) {
+                 Layer& L = *all[c.li];
+                 if (used + L.stride > budget) break;
+-                uint8_t* dst = (uint8_t*) std::malloc(L.stride);
++                uint8_t* dst = nullptr;
++                if (split_on()) {   // page-aligned and registered: the split streams these blocks
++                    const size_t al = (L.stride + 4095) / 4096 * 4096;
++                    dst = (uint8_t*) std::aligned_alloc(4096, al);
++                    if (dst && hipHostRegister(dst, al, hipHostRegisterDefault) == cudaSuccess) g_pinned.insert(dst);
++                    else (void) cudaGetLastError();
++                } else {
++                    dst = (uint8_t*) std::malloc(L.stride);
++                }
+                 if (!dst) break;
+                 std::memcpy(dst, L.hx[(size_t) c.x], L.L.bytes);
+                 pack_drop(L.hx[(size_t) c.x], L.L.bytes);
+@@ -3461,6 +3626,33 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
+     CK(cudaMalloc(&E.d_miss, T * Kp * 4));
+     E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
+     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
++    if (split_on() && !g_pinned.empty()) {
++        size_t mx = 0;
++        for (size_t li = 0; li < all.size(); ++li) mx = std::max(mx, all[li]->stride);
++        E.sp_stride = (mx + 255) / 256 * 256;
++        const size_t want = E.sp_stride * Engine::kSpMax + kMmqTail;
++        if (cudaMalloc(&E.sp_stage, want) != cudaSuccess) {
++            (void) cudaGetLastError();
++            E.sp_stage = nullptr;
++            std::fprintf(stderr, "strata-q36: split: no VRAM for the %.1f MB stage, split off\n", want / 1e6);
++        } else {
++            CK(cudaMemset(E.sp_stage, 0, want));
++            CK(cudaStreamCreateWithFlags(&E.sp_st, cudaStreamNonBlocking));
++            CK(cudaEventCreateWithFlags(&E.sp_copied, cudaEventDisableTiming));
++            CK(cudaEventCreateWithFlags(&E.sp_used, cudaEventDisableTiming));
++            CK(cudaEventCreate(&E.sp_c0));
++            CK(cudaEventCreate(&E.sp_c1));
++            CK(cudaEventRecord(E.sp_used, E.st));
++            CK(cudaHostAlloc((void**) &E.sp_hmeta, 512, cudaHostAllocDefault));
++            CK(cudaMalloc((void**) &E.sp_dmeta, 512));
++            const char* fr = std::getenv("STRATA_Q36_SPLIT_FRAC");
++            if (fr && *fr) { E.sp_frac = std::atof(fr); E.sp_auto = false; }
++            size_t fb = 0, tb = 0;
++            CK(cudaMemGetInfo(&fb, &tb));
++            std::fprintf(stderr, "strata-q36: split: %zu RAM-tier experts pinned, stage %.1f MB (%d experts), frac %.2f, %.0f MB VRAM free\n",
++                         g_pinned.size(), want / 1e6, Engine::kSpMax, E.sp_frac, fb / 1e6);
++        }
++    }
+     if (staging) {
+         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
+         for (int b = 0; b < 2; ++b) {
+@@ -4070,6 +4262,11 @@ struct Serve {
+         std::mt19937_64 rng(smp.seed);
+         std::vector<int32_t> hist = ids;
+         const auto d0 = Clock::now();
++        struct rusage ru0;
++        getrusage(RUSAGE_SELF, &ru0);
++        E.dt = {};
++        E.sp_n = E.sp_bytes = 0;
++        E.sp_copy_ms = 0;
+         long long produced = 0, offered = 0, accepted = 0;
+         const char* finish = "length";
+         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
+@@ -4156,6 +4353,31 @@ struct Serve {
+         }
+         E.sess[(size_t) E.cur].pos = E.pos;
+         const double decode_ms = ms_since(d0);
++        if (Engine::dt_on() && E.dt.n_tok > 0) {
++            struct rusage ru1;
++            getrusage(RUSAGE_SELF, &ru1);
++            const auto& D = E.dt;
++            const double k = 1.0 / (double) D.n_tok;
++            std::fprintf(stderr, "strata-q36 DTIME: %lld tokens, wall/token %.3f ms | fwd(host issue+spin+cpu) %.3f, spin(wait router) %.3f, "
++                         "cpu build %.3f, cpu pool %.3f, greedy sync %.3f ms | layers with CPU work %.1f/%.1f, CPU entries %.1f of %.1f, "
++                         "CPU expert bytes %.1f MB/token (%.1f experts from pack), pool BW %.2f GB/s | majflt %ld minflt %ld\n",
++                         D.n_tok, decode_ms * k, D.fwd * k, D.spin * k, D.build * k, D.pool * k, D.greedy * k,
++                         D.n_cpu_layers * k, D.n_layers * k, D.n_miss * k, D.n_ent * k, D.bytes * k / 1e6,
++                         D.n_pack * k, D.pool > 0 ? (double) D.bytes / (D.pool * 1e6) : 0.0,
++                         ru1.ru_majflt - ru0.ru_majflt, ru1.ru_minflt - ru0.ru_minflt);
++            if (E.sp_stage)
++                std::fprintf(stderr, "strata-q36 SPLIT: frac %.3f%s, %.1f experts/token streamed (%.1f MB/token), copy %.3f ms/token, PCIe %.2f GB/s\n",
++                             E.sp_frac, E.sp_auto ? " (auto, now)" : "", E.sp_n * k, E.sp_bytes * k / 1e6, E.sp_copy_ms * k,
++                             E.sp_copy_ms > 0 ? (double) E.sp_bytes / (E.sp_copy_ms * 1e6) : 0.0);
++            if (E.sp_chk_n)
++                std::fprintf(stderr, "strata-q36 SPLIT_CHECK: %lld streamed rows vs the pool: rel L2 mean %.3e max %.3e\n", E.sp_chk_n,
++                             E.sp_chk_sum / E.sp_chk_n, E.sp_chk_max);
++            if (E.sp_ref_n)
++                std::fprintf(stderr, "strata-q36 SPLIT_CHECK reference: %lld slot rows (GPU slot kernel) vs the pool: rel L2 mean %.3e max %.3e\n",
++                             E.sp_ref_n, E.sp_ref_sum / E.sp_ref_n, E.sp_ref_max);
++        }
++        E.sp_n = E.sp_bytes = 0;
++        E.sp_copy_ms = 0;
+         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
+                     decode_ms, finish, accepted, offered, reuse, (long long) fresh);
+         std::fflush(stdout);
+-- 
+2.43.0
+
